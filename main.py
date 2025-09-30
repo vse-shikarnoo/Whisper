@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
 import os
 import tempfile
@@ -10,36 +10,42 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Enhanced Audio Processing API", version="4.0.0")
+app = FastAPI(title="Ollama Audio Processing API", version="5.0.0")
 
-# Пробуем загрузить улучшенный процессор
+# Пробуем загрузить улучшенный процессор с Ollama
 try:
-    from enhanced_audio_processor import EnhancedAudioProcessor
-    from simple_diarization import SimpleDiarization
+    from ollama_audio_processor import OllamaAudioProcessor
     
     HF_TOKEN = os.getenv("HF_TOKEN")
-    enhanced_processor = EnhancedAudioProcessor(hf_token=HF_TOKEN)
-    simple_diarization = SimpleDiarization()
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+    OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
     
-    logger.info("Улучшенный процессор загружен")
+    processor = OllamaAudioProcessor(
+        hf_token=HF_TOKEN,
+        ollama_model=OLLAMA_MODEL,
+        ollama_host=OLLAMA_HOST
+    )
+    
+    logger.info("OllamaAudioProcessor успешно инициализирован")
+    
 except Exception as e:
-    logger.error(f"Ошибка загрузки улучшенного процессора: {e}")
-    enhanced_processor = None
-    simple_diarization = None
+    logger.error(f"Ошибка загрузки OllamaAudioProcessor: {e}")
+    processor = None
 
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 @app.post("/process")
-async def process_audio_file(file: UploadFile = File(...), method: str = "enhanced"):
+async def process_audio_file(
+    file: UploadFile = File(...),
+    use_ollama: bool = Query(True, description="Использовать Ollama для суммаризации"),
+    ollama_model: str = Query(None, description="Модель Ollama (если не указана, используется настройка по умолчанию)")
+):
     """
-    Обработка аудио/видео файла с выбором метода диаризации
-    
-    Parameters:
-    - method: "enhanced" (улучшенная), "simple" (простая), "auto" (автовыбор)
+    Обработка аудио/видео файла с поддержкой Ollama
     """
-    if not enhanced_processor and method != "simple":
-        raise HTTPException(status_code=500, detail="Enhanced processor not available")
+    if not processor:
+        raise HTTPException(status_code=500, detail="Audio processor not available")
     
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -50,6 +56,12 @@ async def process_audio_file(file: UploadFile = File(...), method: str = "enhanc
     
     if file_extension not in allowed_extensions:
         raise HTTPException(status_code=400, detail="File type not supported")
+    
+    # Временно меняем модель Ollama если указана
+    original_model = processor.ollama_model
+    if ollama_model and processor.ollama_available:
+        processor.ollama_model = ollama_model
+        logger.info(f"Временно используем модель Ollama: {ollama_model}")
     
     # Создаем временный файл
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
@@ -62,19 +74,10 @@ async def process_audio_file(file: UploadFile = File(...), method: str = "enhanc
         temp_file.write(content)
         temp_file.close()
         
-        logger.info(f"Обработка файла методом: {method}")
+        logger.info(f"Обработка файла с использованием Ollama: {use_ollama}")
         
-        # Выбираем метод обработки
-        if method == "simple":
-            result = await process_simple_method(temp_file.name)
-        elif method == "enhanced":
-            result = enhanced_processor.process_file(temp_file.name)
-        else:  # auto
-            try:
-                result = enhanced_processor.process_file(temp_file.name)
-            except Exception as e:
-                logger.warning(f"Улучшенный метод не сработал: {e}")
-                result = await process_simple_method(temp_file.name)
+        # Обрабатываем файл
+        result = processor.process_file(temp_file.name, use_ollama=use_ollama)
         
         # Сохраняем результат
         result_id = str(uuid.uuid4())
@@ -85,7 +88,6 @@ async def process_audio_file(file: UploadFile = File(...), method: str = "enhanc
             json.dump(result, f, ensure_ascii=False, indent=2)
         
         result['result_id'] = result_id
-        result['processing_method'] = method
         
         return JSONResponse(content=result)
         
@@ -94,112 +96,83 @@ async def process_audio_file(file: UploadFile = File(...), method: str = "enhanc
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
     
     finally:
+        # Восстанавливаем оригинальную модель
+        if ollama_model and processor.ollama_available:
+            processor.ollama_model = original_model
+        
+        # Удаляем временный файл
         if os.path.exists(temp_file.name):
             try:
                 os.unlink(temp_file.name)
             except:
                 pass
 
-async def process_simple_method(file_path: str):
-    """Простой метод обработки с базовой диаризацией"""
-    import whisper
+@app.get("/ollama/models")
+async def get_ollama_models():
+    """Получение списка доступных моделей Ollama"""
+    if not processor or not processor.ollama_available:
+        raise HTTPException(status_code=500, detail="Ollama not available")
     
-    # Базовая транскрибация
-    model = whisper.load_model("base")
-    result = model.transcribe(file_path, language="ru", verbose=False)
+    try:
+        import ollama
+        client = ollama.Client(host=processor.ollama_host)
+        models_response = client.list()
+        models = [model['name'] for model in models_response['models']]
+        
+        return {
+            "available_models": models,
+            "current_model": processor.ollama_model,
+            "ollama_host": processor.ollama_host
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting Ollama models: {str(e)}")
+
+@app.post("/ollama/set_model")
+async def set_ollama_model(model: str = Query(..., description="Название модели Ollama")):
+    """Смена модели Ollama"""
+    if not processor or not processor.ollama_available:
+        raise HTTPException(status_code=500, detail="Ollama not available")
     
-    segments = []
-    for segment in result["segments"]:
-        segments.append({
-            "start": segment["start"],
-            "end": segment["end"],
-            "text": segment["text"].strip(),
-            "speaker": None
-        })
-    
-    # ПОЛУЧАЕМ ПОЛНЫЙ ТЕКСТ
-    full_text = result["text"]
-    
-    # ПРОСТАЯ СУММАРИЗАЦИЯ ПОЛНОГО ТЕКСТА
-    full_text_summary = full_text[:500] + "..." if len(full_text) > 500 else full_text
-    
-    # Простая диаризация
-    if simple_diarization:
-        segments = simple_diarization.diarize_by_silence(segments)
-        segments = simple_diarization.merge_short_segments(segments)
-    else:
-        # Базовая эвристика
-        for i, segment in enumerate(segments):
-            segment["speaker"] = f"speaker_{i % 2 + 1}"
-    
-    # Группировка по спикерам
-    speaker_texts = {}
-    for segment in segments:
-        speaker = segment["speaker"]
-        if speaker not in speaker_texts:
-            speaker_texts[speaker] = []
-        speaker_texts[speaker].append(segment["text"])
-    
-    speaker_texts = {k: " ".join(v) for k, v in speaker_texts.items()}
-    
-    # Суммаризация по спикерам
-    speaker_summaries = {}
-    for speaker, text in speaker_texts.items():
-        speaker_summaries[speaker] = text[:200] + "..." if len(text) > 200 else text
+    try:
+        import ollama
+        client = ollama.Client(host=processor.ollama_host)
+        
+        # Проверяем, что модель существует
+        models_response = client.list()
+        available_models = [m['name'] for m in models_response['models']]
+        
+        if model not in available_models:
+            raise HTTPException(status_code=400, detail=f"Model {model} not available. Available models: {available_models}")
+        
+        processor.ollama_model = model
+        
+        return {
+            "message": f"Model changed to {model}",
+            "current_model": processor.ollama_model
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error setting Ollama model: {str(e)}")
+
+@app.get("/status")
+async def get_status():
+    """Получение статуса системы"""
+    ollama_status = "available" if processor and processor.ollama_available else "unavailable"
+    diarization_status = "available" if processor and processor.diarization_pipeline else "unavailable"
     
     return {
-        # Полный текст и его суммаризация
-        "full_text": full_text,
-        "full_text_summary": full_text_summary,
-        
-        # Детализированные данные
-        "segments": segments,
-        "speaker_texts": speaker_texts,
-        "speaker_summaries": speaker_summaries,
-        
-        # Статистика
-        "speakers_count": len(speaker_texts),
-        "total_segments": len(segments),
-        "total_text_length": len(full_text),
-        "diarization_quality": "simple",
-        "speakers_detected": list(speaker_texts.keys()),
-        
-        # Метаинформация
-        "processing_method": "simple",
-        "summarization_enabled": False
+        "processor_available": processor is not None,
+        "ollama_status": ollama_status,
+        "ollama_model": processor.ollama_model if processor else None,
+        "diarization_status": diarization_status,
+        "transformers_summarization": processor.transformers_summarization is not None if processor else False
     }
 
-@app.get("/methods")
-async def get_available_methods():
-    """Доступные методы обработки"""
-    return {
-        "methods": [
-            {
-                "name": "enhanced",
-                "description": "Улучшенная диаризация с pyannote (требуется HF_TOKEN)",
-                "available": enhanced_processor is not None and enhanced_processor.diarization_pipeline is not None
-            },
-            {
-                "name": "simple", 
-                "description": "Простая диаризация на основе пауз",
-                "available": simple_diarization is not None
-            },
-            {
-                "name": "auto",
-                "description": "Автоматический выбор лучшего доступного метода",
-                "available": enhanced_processor is not None or simple_diarization is not None
-            }
-        ]
-    }
-
+# ... остальные endpoint'ы (results, download, health) остаются без изменений ...
 @app.get("/results/{result_id}")
 async def get_result(result_id: str):
-    """Получение результата по ID"""
     result_path = os.path.join(RESULTS_DIR, f"{result_id}_result.json")
-    
     if not os.path.exists(result_path):
         raise HTTPException(status_code=404, detail="Result not found")
-    
     try:
         with open(result_path, 'r', encoding='utf-8') as f:
             result = json.load(f)
@@ -209,12 +182,9 @@ async def get_result(result_id: str):
 
 @app.get("/download/{result_id}")
 async def download_result(result_id: str):
-    """Скачивание результата в виде JSON файла"""
     result_path = os.path.join(RESULTS_DIR, f"{result_id}_result.json")
-    
     if not os.path.exists(result_path):
         raise HTTPException(status_code=404, detail="Result not found")
-    
     return FileResponse(
         path=result_path,
         filename=f"transcription_{result_id}.json",
@@ -223,28 +193,26 @@ async def download_result(result_id: str):
 
 @app.get("/health")
 async def health_check():
-    """Проверка статуса API"""
-    status = "healthy" if (enhanced_processor or simple_diarization) else "unhealthy"
+    status = "healthy" if processor else "unhealthy"
     return {
         "status": status, 
         "timestamp": datetime.now().isoformat(),
-        "enhanced_processor": enhanced_processor is not None,
-        "simple_diarization": simple_diarization is not None
+        "processor_initialized": processor is not None,
+        "ollama_available": processor.ollama_available if processor else False
     }
 
 @app.get("/")
 async def root():
-    """Корневой endpoint"""
     return {
-        "message": "Enhanced Audio Processing API v4.0",
-        "status": "running" if (enhanced_processor or simple_diarization) else "initialization failed",
+        "message": "Ollama Audio Processing API v5.0",
+        "status": "running" if processor else "initialization failed",
         "features": [
             "Транскрибация аудио/видео",
             "Определение спикеров", 
             "Полный текст без разбивки",
-            "Суммаризация полного текста",
-            "Суммаризация по спикерам",
-            "Детализированные сегменты"
+            "Умная суммаризация через Ollama",
+            "Резервная суммаризация через трансформеры",
+            "Поддержка различных моделей Ollama"
         ]
     }
 
